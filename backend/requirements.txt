@@ -1,0 +1,4 @@
+fastapi
+httpx
+mcp>=1.27,<2
+uvicorn[standard]

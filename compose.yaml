@@ -1,0 +1,8 @@
+services:
+  backend:
+    build: .
+    image: vault-mind-backend:local
+    container_name: vault-mind-backend-local
+    network_mode: host
+    env_file:
+      - /home/yung/.config/vault-mind-backend/runtime.env
