@@ -12,7 +12,9 @@ async def tools() -> dict[str, object]:
     try:
         return {"tools": await list_tools()}
     except McpError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(status_code=exc.status_code, detail={
+            "message": str(exc), "code": exc.code, "status_code": exc.status_code,
+        }) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -22,6 +24,8 @@ async def run_tool(tool_name: str, arguments: dict[str, Any] | None = None) -> d
     try:
         return await call_tool(tool_name, arguments)
     except McpError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(status_code=exc.status_code, detail={
+            "message": str(exc), "code": exc.code, "status_code": exc.status_code,
+        }) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

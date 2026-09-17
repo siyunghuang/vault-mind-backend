@@ -25,6 +25,10 @@ class Settings:
     )
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
     gemini_models: str = os.getenv("GEMINI_MODELS", "")
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    openai_base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
+    openai_models: str = os.getenv("OPENAI_MODELS", "gpt-5.4-mini")
     local_model_endpoint: str = os.getenv("LOCAL_MODEL_ENDPOINT", "http://127.0.0.1:11434")
     local_model_name: str = os.getenv("LOCAL_MODEL_NAME", "llama3")
     local_models: str = os.getenv("LOCAL_MODELS", "")
@@ -39,8 +43,8 @@ class Settings:
     def __post_init__(self) -> None:
         if self.model_provider not in {"cloud", "local"}:
             raise ValueError("MODEL_PROVIDER must be 'cloud' or 'local'")
-        if self.cloud_provider not in {"nvidia", "gemini"}:
-            raise ValueError("CLOUD_PROVIDER must be 'nvidia' or 'gemini'")
+        if self.cloud_provider not in {"nvidia", "gemini", "openai"}:
+            raise ValueError("CLOUD_PROVIDER must be 'nvidia', 'gemini', or 'openai'")
         if self.chat_mcp_max_rounds < 1:
             raise ValueError("CHAT_MCP_MAX_ROUNDS must be at least 1")
 

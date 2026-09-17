@@ -1,5 +1,7 @@
 # Frontend Integration
 
+For response rendering, SSE handling, and the frontend agent's acceptance checklist, follow [Frontend Response Display Handoff](/home/yung/MyGitRepo/vault-mind-backend/docs/frontend-response-display.md). That document distinguishes frontend presentation fixes from the separate backend work needed for incremental model streaming.
+
 Backend repo path:
 
 ```text
@@ -34,7 +36,7 @@ Backend runtime secrets live outside the repo:
 /home/yung/.config/vault-mind-backend/runtime.env
 ```
 
-That file must contain `MODEL_PROVIDER=cloud`, `CLOUD_PROVIDER=nvidia` or `CLOUD_PROVIDER=gemini`, and the matching server-side API key before the frontend can use cloud chat. The frontend never receives NVIDIA or Gemini keys.
+That file must contain `MODEL_PROVIDER=cloud`, `CLOUD_PROVIDER=nvidia`, `CLOUD_PROVIDER=gemini`, or `CLOUD_PROVIDER=openai`, and the matching server-side API key before the frontend can use cloud chat. The frontend never receives NVIDIA, Gemini, or OpenAI keys.
 
 Backend APIs used by the helper:
 
@@ -87,7 +89,7 @@ Frontend implementation steps:
 2. Keep appending `event.content` when `event.type === "token"`.
 3. Store `event.sources ?? []` when `event.type === "sources"`.
 4. Store `event.sections ?? []` when `event.type === "sections"`.
-5. Render sections below the answer and sources as clickable note references using the displayed `path`.
+5. Render section content as Markdown inside a collapsed `Vault details` disclosure below the answer; show sources as compact note references. Follow the display handoff for safe links and full-path labels.
 6. Do not parse source paths out of markdown response text.
 
 ## Obsidian MCP
@@ -103,7 +105,17 @@ const result = await callMcpTool("search_simple", {
 });
 ```
 
-When `CHAT_MCP_ENABLED=true` is set in `/home/yung/.config/vault-mind-backend/runtime.env`, cloud chat can auto-call read-only Obsidian MCP tools. Manual MCP endpoints remain available for direct frontend workflows.
+When `CHAT_MCP_ENABLED=true` is set in `/home/yung/.config/vault-mind-backend/runtime.env`, cloud chat preloads Obsidian vault context before answering and can auto-call read-only Obsidian MCP tools. Keep `MCP_REQUIRED=true` if chat should fail instead of answering without vault access. Manual MCP endpoints remain available for direct frontend workflows.
+
+### Project Context and Diagnostics
+
+The backend decodes MCP text/structured results before extracting note contents, search paths, and source excerpts. It reads `00-Index.md` on every cloud chat and matches the question against project wikilink labels and capsule directory names. A unique match preloads that project's `README.md` and `state.md`. Ambiguous or unmatched questions receive the index; the model can search with targeted terms or ask for clarification. Preloaded context is limited to four notes and 12,000 characters.
+
+Successful identical read-only tool calls are reused within a chat, including notes read during grounding. The cache is discarded when that chat ends. Manual MCP endpoints continue returning raw MCP envelopes. The existing SSE events and source fields are unchanged.
+
+`POST /api/chat` returns a generated `X-Request-ID` header, exposed through CORS. Frontend code using `fetch` can read `response.headers.get("X-Request-ID")` and include it in a bug report; it matches `request_id` in backend logs. The helper in `/home/yung/MyGitRepo/vault-mind-backend/frontend/api.ts` continues working without changes.
+
+Use `chat_complete` to compare total elapsed time, `tool_executions` (actual tool calls, excluding discovery), `cache_hits`, `ai_rounds`, `notes_extracted` (successful nonempty note extractions), and `context_chars` (the full preload message). `chat_mcp_grounding_complete` includes the number of matching projects. `provider_usage` logs provider-reported input/output token counts for each response, including finalization; absent usage is `unavailable`, not an estimate. Logs outside a chat use `request_id=-`. Note contents and raw user prompts remain excluded from default diagnostics.
 
 ## Chat Errors
 
@@ -113,7 +125,23 @@ When `CHAT_MCP_ENABLED=true` is set in `/home/yung/.config/vault-mind-backend/ru
 {"type":"error","message":"cloud provider unavailable: HTTP 429","code":"rate_limited","status_code":429}
 ```
 
-Common `code` values include `rate_limited`, `provider_timeout`, `provider_http_error`, `provider_bad_response`, `mcp_unavailable`, and `mcp_tool_failed`.
+Common `code` values include `rate_limited`, `provider_timeout`, `provider_http_error`, `provider_bad_response`, `mcp_timeout`, and `mcp_unavailable`.
+
+AI timeouts return `provider_timeout` with `status_code: 504`; Obsidian timeouts return `mcp_timeout` with `status_code: 504`. Obsidian connection failures return `mcp_unavailable` with `status_code: 502` (missing MCP configuration uses `503`). Each complete MCP operation has a 30-second deadline. No automatic retries are performed.
+
+The backend sends one `error` event followed by one `done`, then closes the stream. Chat HTTP status remains `200` after streaming starts, so checking `response.ok` alone will not detect these failures. The helper in `/home/yung/MyGitRepo/vault-mind-backend/frontend/api.ts` forwards both events to `onEvent`:
+
+- On `error`, show `event.message`, record the failed state, and clear loading.
+- On `done`, clear loading without overwriting the failed state or discarding partial output.
+- Catch fetch/stream errors too, since a disconnected browser cannot receive backend events.
+
+Manual `GET /api/mcp/tools` and `POST /api/mcp/tools/{tool_name}` failures use actual HTTP `504`/`502` statuses and a JSON body such as:
+
+```json
+{"detail":{"message":"Obsidian request timed out. Please try again.","code":"mcp_timeout","status_code":504}}
+```
+
+Docker logs include `mcp_request_failed` with the operation/tool, error code, elapsed milliseconds, and underlying exception types.
 
 ## Docker Diagnostics
 
@@ -127,6 +155,8 @@ Useful log keys:
 
 ```text
 chat_start
+chat_mcp_grounding_start
+chat_mcp_grounding_complete
 chat_mcp_tools_loaded
 cloud_provider_tool_call_requested
 chat_mcp_tool_request

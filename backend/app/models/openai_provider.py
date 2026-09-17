@@ -45,26 +45,115 @@ def _http_error_code(status_code: int) -> str:
     }.get(status_code, "provider_http_status")
 
 
-class CloudProvider:
+def _messages_to_input(messages: list[Message]) -> list[dict[str, str]]:
+    return [{"role": message.role, "content": message.content} for message in messages]
+
+
+def _response_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    response_tools = []
+    for tool in tools or []:
+        function = tool.get("function") or {}
+        name = function.get("name")
+        if not name:
+            continue
+        response_tools.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": function.get("description") or name,
+                "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+            }
+        )
+    return response_tools
+
+
+def _output_text(response: dict[str, Any]) -> str:
+    text = response.get("output_text")
+    if isinstance(text, str):
+        return text
+    chunks = []
+    for item in response.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for content in item.get("content") or []:
+            if isinstance(content, dict) and content.get("type") == "output_text":
+                chunks.append(str(content.get("text") or ""))
+    return "".join(chunks)
+
+
+def _function_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in response.get("output") or []
+        if isinstance(item, dict) and item.get("type") == "function_call"
+    ]
+
+
+class OpenAIProvider:
     name = "cloud"
 
-    def __init__(self, settings: Settings, cloud_provider: str | None = None, model: str | None = None) -> None:
+    def __init__(self, settings: Settings, model: str | None = None) -> None:
         self.settings = settings
-        self.cloud_provider = cloud_provider or settings.cloud_provider
+        self.cloud_provider = "openai"
         self.model = model
 
     def _config(self) -> tuple[str, str, str]:
-        if self.cloud_provider == "gemini":
-            return (
-                self.settings.gemini_api_key,
-                self.settings.gemini_base_url,
-                self.model or self.settings.gemini_model,
-            )
         return (
-            self.settings.nvidia_api_key,
-            self.settings.nvidia_base_url,
-            self.model or self.settings.cloud_model,
+            self.settings.openai_api_key,
+            self.settings.openai_base_url,
+            self.model or self.settings.openai_model,
         )
+
+    async def _post(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        model: str,
+        round_index: int,
+    ) -> dict[str, Any]:
+        log_extra = ""
+        if self.settings.log_payloads:
+            log_extra = f" payload_preview={_preview(payload, self.settings.log_payload_chars)}"
+        logger.info(
+            "cloud_provider_request provider=%s model=%s round=%s messages=%s tools=%s request_bytes=%s%s",
+            self.cloud_provider,
+            model,
+            round_index,
+            len(payload.get("input") or []),
+            len(payload.get("tools") or []),
+            _json_len(payload),
+            log_extra,
+        )
+        started = time.perf_counter()
+        record_ai_request()
+        response = await client.post(
+            f"{base_url.rstrip('/')}/responses",
+            headers=headers,
+            json=payload,
+        )
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        response.raise_for_status()
+        data = response.json()
+        log_usage(self.cloud_provider, model, data.get("usage"))
+        tool_calls = _function_calls(data)
+        content = _output_text(data)
+        response_extra = ""
+        if self.settings.log_payloads:
+            response_extra = f" response_preview={_preview(data, self.settings.log_payload_chars)}"
+        logger.info(
+            "cloud_provider_response provider=%s model=%s round=%s status_code=%s elapsed_ms=%s tool_calls=%s content_chars=%s%s",
+            self.cloud_provider,
+            model,
+            round_index,
+            response.status_code,
+            elapsed_ms,
+            len(tool_calls),
+            len(content),
+            response_extra,
+        )
+        return data
 
     async def generate(
         self,
@@ -73,14 +162,11 @@ class CloudProvider:
         tool_runner: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None,
     ) -> AsyncIterator[Chunk]:
         api_key, base_url, model = self._config()
-        key_name = "GEMINI_API_KEY" if self.cloud_provider == "gemini" else "NVIDIA_API_KEY"
         if not api_key:
-            raise ProviderError(
-                f"cloud provider unavailable: {key_name} is not set",
-                code="missing_api_key",
-            )
+            raise ProviderError("cloud provider unavailable: OPENAI_API_KEY is not set", code="missing_api_key")
 
-        payload_messages: list[dict[str, Any]] = [message.__dict__ for message in messages]
+        input_items: list[dict[str, Any]] = _messages_to_input(messages)
+        response_tools = _response_tools(tools)
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Accept": "application/json",
@@ -91,64 +177,22 @@ class CloudProvider:
                 for round_index in range(self.settings.chat_mcp_max_rounds):
                     payload: dict[str, Any] = {
                         "model": model,
-                        "messages": payload_messages,
-                        "max_tokens": 8192,
-                        "temperature": 1.0,
-                        "top_p": 0.95,
-                        "stream": False,
+                        "input": input_items,
+                        "max_output_tokens": 8192,
                     }
-                    if tools and tool_runner:
-                        payload["tools"] = tools
+                    if response_tools and tool_runner:
+                        payload["tools"] = response_tools
                         payload["tool_choice"] = "auto"
-                    log_extra = ""
-                    if self.settings.log_payloads:
-                        log_extra = f" payload_preview={_preview(payload, self.settings.log_payload_chars)}"
-                    logger.info(
-                        "cloud_provider_request provider=%s model=%s round=%s messages=%s tools=%s request_bytes=%s%s",
-                        self.cloud_provider,
-                        model,
-                        round_index + 1,
-                        len(payload_messages),
-                        len(tools or []),
-                        _json_len(payload),
-                        log_extra,
-                    )
-                    started = time.perf_counter()
-                    record_ai_request()
-                    response = await client.post(
-                        f"{base_url.rstrip('/')}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    )
-                    elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    response.raise_for_status()
-                    data = response.json()
-                    log_usage(self.cloud_provider, model, data.get("usage"))
-                    message = data["choices"][0]["message"]
-                    tool_calls = message.get("tool_calls") or []
-                    response_extra = ""
-                    if self.settings.log_payloads:
-                        response_extra = f" response_preview={_preview(message, self.settings.log_payload_chars)}"
-                    logger.info(
-                        "cloud_provider_response provider=%s model=%s round=%s status_code=%s elapsed_ms=%s tool_calls=%s content_chars=%s%s",
-                        self.cloud_provider,
-                        model,
-                        round_index + 1,
-                        response.status_code,
-                        elapsed_ms,
-                        len(tool_calls),
-                        len(message.get("content") or ""),
-                        response_extra,
-                    )
+                    response = await self._post(client, base_url, headers, payload, model, round_index + 1)
+                    tool_calls = _function_calls(response)
                     if not tool_calls or not tool_runner:
-                        yield Chunk(type="token", content=message.get("content") or "")
+                        yield Chunk(type="token", content=_output_text(response))
                         return
 
-                    payload_messages.append(message)
+                    input_items.extend(response.get("output") or [])
                     for tool_call in tool_calls:
-                        function = tool_call["function"]
-                        name = function["name"]
-                        arguments = json.loads(function.get("arguments") or "{}")
+                        name = str(tool_call["name"])
+                        arguments = json.loads(tool_call.get("arguments") or "{}")
                         args_extra = ""
                         if self.settings.log_payloads:
                             args_extra = f" args_preview={_preview(arguments, self.settings.log_payload_chars)}"
@@ -158,29 +202,29 @@ class CloudProvider:
                             model,
                             round_index + 1,
                             name,
-                            tool_call["id"],
+                            tool_call.get("call_id") or tool_call.get("id"),
                             _json_len(arguments),
                             args_extra,
                         )
                         yield Chunk(type="tool_call", content=name)
                         result = await tool_runner(name, arguments)
                         yield Chunk(type="tool_result", content=name)
-                        payload_messages.append(
+                        input_items.append(
                             {
-                                "role": "tool",
-                                "tool_call_id": tool_call["id"],
-                                "name": name,
-                                "content": json.dumps(result),
+                                "type": "function_call_output",
+                                "call_id": tool_call["call_id"],
+                                "output": json.dumps(result),
                             }
                         )
+
                 logger.warning(
                     "cloud_provider_tool_round_limit_finalize provider=%s model=%s rounds=%s messages=%s",
                     self.cloud_provider,
                     model,
                     self.settings.chat_mcp_max_rounds,
-                    len(payload_messages),
+                    len(input_items),
                 )
-                payload_messages.append(
+                input_items.append(
                     {
                         "role": "user",
                         "content": (
@@ -191,54 +235,19 @@ class CloudProvider:
                 )
                 payload = {
                     "model": model,
-                    "messages": payload_messages,
-                    "max_tokens": 8192,
-                    "temperature": 1.0,
-                    "top_p": 0.95,
-                    "stream": False,
+                    "input": input_items,
+                    "max_output_tokens": 8192,
                 }
-                log_extra = ""
-                if self.settings.log_payloads:
-                    log_extra = f" payload_preview={_preview(payload, self.settings.log_payload_chars)}"
-                logger.info(
-                    "cloud_provider_request provider=%s model=%s round=%s messages=%s tools=%s request_bytes=%s%s",
-                    self.cloud_provider,
+                response = await self._post(
+                    client,
+                    base_url,
+                    headers,
+                    payload,
                     model,
                     self.settings.chat_mcp_max_rounds + 1,
-                    len(payload_messages),
-                    0,
-                    _json_len(payload),
-                    log_extra,
                 )
-                started = time.perf_counter()
-                record_ai_request()
-                response = await client.post(
-                    f"{base_url.rstrip('/')}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
-                elapsed_ms = int((time.perf_counter() - started) * 1000)
-                response.raise_for_status()
-                data = response.json()
-                log_usage(self.cloud_provider, model, data.get("usage"))
-                message = data["choices"][0]["message"]
-                tool_calls = message.get("tool_calls") or []
-                response_extra = ""
-                if self.settings.log_payloads:
-                    response_extra = f" response_preview={_preview(message, self.settings.log_payload_chars)}"
-                logger.info(
-                    "cloud_provider_response provider=%s model=%s round=%s status_code=%s elapsed_ms=%s tool_calls=%s content_chars=%s%s",
-                    self.cloud_provider,
-                    model,
-                    self.settings.chat_mcp_max_rounds + 1,
-                    response.status_code,
-                    elapsed_ms,
-                    len(tool_calls),
-                    len(message.get("content") or ""),
-                    response_extra,
-                )
-                if not tool_calls and message.get("content"):
-                    yield Chunk(type="token", content=message["content"])
+                if not _function_calls(response) and _output_text(response):
+                    yield Chunk(type="token", content=_output_text(response))
                     return
                 raise ProviderError(
                     "cloud provider exceeded MCP tool round limit",

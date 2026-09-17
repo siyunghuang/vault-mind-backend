@@ -35,7 +35,7 @@ class ModelProvider(Protocol):
         self,
         messages: list[Message],
         tools: list[dict[str, Any]] | None = None,
-        tool_runner: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+        tool_runner: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None,
     ) -> AsyncIterator[Chunk]:
         ...
 

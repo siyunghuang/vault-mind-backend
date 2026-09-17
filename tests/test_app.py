@@ -11,9 +11,11 @@ from app.models.base import Chunk, Message, ProviderError
 from app.models.cloud_provider import CloudProvider
 from app.models.factory import get_provider
 from app.models.local_provider import LocalProvider
+from app.models.openai_provider import OpenAIProvider
 from app.schemas.chat import ChatRequest
 import app.api.chat as chat_api
 import app.models.cloud_provider as cloud_provider
+import app.models.openai_provider as openai_provider
 from app.mcp import client as mcp_client
 
 
@@ -46,9 +48,10 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(response["default"], "local")
         self.assertEqual(response["default_model_id"], "local:llama3")
         self.assertIn("local:llama3", [model["id"] for model in response["models"]])
+        self.assertIn("openai:gpt-5.4-mini", [model["id"] for model in response["models"]])
         self.assertLessEqual(
             {model["provider"] for model in response["models"]},
-            {"local", "nvidia", "gemini"},
+            {"local", "nvidia", "gemini", "openai"},
         )
         self.assertEqual(app.title, "Vault Mind Backend")
 
@@ -58,6 +61,12 @@ class BackendTest(unittest.TestCase):
         self.assertIsInstance(provider, CloudProvider)
         self.assertEqual(provider.cloud_provider, "gemini")
         self.assertEqual(provider.model, "gemini-3.5-flash")
+
+    def test_model_id_selects_openai_model(self) -> None:
+        provider = get_provider(model_id="openai:gpt-5.4-mini")
+
+        self.assertIsInstance(provider, OpenAIProvider)
+        self.assertEqual(provider.model, "gpt-5.4-mini")
 
     def test_model_id_selects_local_model(self) -> None:
         provider = get_provider(model_id="local:llama3")
@@ -85,6 +94,15 @@ class BackendTest(unittest.TestCase):
         async def run() -> None:
             provider = CloudProvider(Settings(cloud_provider="gemini", gemini_api_key=""))
             with self.assertRaisesRegex(ProviderError, "GEMINI_API_KEY"):
+                async for _ in provider.generate([Message(role="user", content="hello")]):
+                    pass
+
+        asyncio.run(run())
+
+    def test_openai_provider_requires_key(self) -> None:
+        async def run() -> None:
+            provider = OpenAIProvider(Settings(openai_api_key=""))
+            with self.assertRaisesRegex(ProviderError, "OPENAI_API_KEY"):
                 async for _ in provider.generate([Message(role="user", content="hello")]):
                     pass
 
@@ -167,6 +185,202 @@ class BackendTest(unittest.TestCase):
             "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
         )
         self.assertEqual(fake.kwargs["json"]["model"], "gemini-3.5-flash")
+
+    def test_openai_provider_parses_response_output_text(self) -> None:
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, object]:
+                return {"output_text": "hello", "output": []}
+
+        class FakeClient:
+            async def __aenter__(self) -> "FakeClient":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                pass
+
+            async def post(self, url: str, **kwargs: object) -> FakeResponse:
+                self.url = url
+                self.kwargs = kwargs
+                return FakeResponse()
+
+        fake = FakeClient()
+        old_client = openai_provider.httpx.AsyncClient
+        openai_provider.httpx.AsyncClient = lambda **_: fake
+        try:
+            provider = OpenAIProvider(Settings(openai_api_key="key"))
+            chunks = asyncio.run(_collect(provider.generate([Message(role="user", content="hi")])))
+        finally:
+            openai_provider.httpx.AsyncClient = old_client
+
+        self.assertEqual(chunks[0].content, "hello")
+        self.assertEqual(fake.url, "https://api.openai.com/v1/responses")
+        self.assertEqual(fake.kwargs["json"]["model"], "gpt-5.4-mini")
+        self.assertEqual(fake.kwargs["json"]["input"], [{"role": "user", "content": "hi"}])
+
+    def test_openai_provider_runs_tool_call(self) -> None:
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, body: dict[str, object]) -> None:
+                self.body = body
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, object]:
+                return self.body
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.requests = []
+                self.responses = [
+                    FakeResponse(
+                        {
+                            "output": [
+                                {
+                                    "id": "fc_1",
+                                    "call_id": "call_1",
+                                    "type": "function_call",
+                                    "name": "search_simple",
+                                    "arguments": "{\"query\":\"index\"}",
+                                }
+                            ]
+                        }
+                    ),
+                    FakeResponse({"output_text": "found index", "output": []}),
+                ]
+
+            async def __aenter__(self) -> "FakeClient":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                pass
+
+            async def post(self, *args: object, **kwargs: object) -> FakeResponse:
+                self.requests.append(kwargs["json"])
+                return self.responses.pop(0)
+
+        async def run() -> list[str]:
+            async def tool_runner(name: str, arguments: dict[str, object]) -> dict[str, object]:
+                self.assertEqual(name, "search_simple")
+                self.assertEqual(arguments, {"query": "index"})
+                return {"result": "hit"}
+
+            provider = OpenAIProvider(Settings(openai_api_key="key"))
+            chunks = await _collect(
+                provider.generate(
+                    [Message(role="user", content="find index")],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "search_simple",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }
+                    ],
+                    tool_runner=tool_runner,
+                )
+            )
+            return [chunk.type for chunk in chunks]
+
+        fake = FakeClient()
+        old_client = openai_provider.httpx.AsyncClient
+        openai_provider.httpx.AsyncClient = lambda **_: fake
+        try:
+            chunk_types = asyncio.run(run())
+        finally:
+            openai_provider.httpx.AsyncClient = old_client
+
+        self.assertEqual(chunk_types, ["tool_call", "tool_result", "token"])
+        self.assertEqual(fake.requests[0]["tools"][0]["name"], "search_simple")
+        self.assertEqual(fake.requests[1]["input"][-1]["type"], "function_call_output")
+        self.assertEqual(fake.requests[1]["input"][-1]["call_id"], "call_1")
+
+    def test_openai_provider_finalizes_after_tool_round_limit(self) -> None:
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, body: dict[str, object]) -> None:
+                self.body = body
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, object]:
+                return self.body
+
+        def function_call(call_id: str) -> dict[str, object]:
+            return {
+                "output": [
+                    {
+                        "id": f"fc_{call_id}",
+                        "call_id": call_id,
+                        "type": "function_call",
+                        "name": "search_simple",
+                        "arguments": "{\"query\":\"index\"}",
+                    }
+                ]
+            }
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.requests = []
+                self.responses = [
+                    FakeResponse(function_call("call_1")),
+                    FakeResponse({"output_text": "final answer", "output": []}),
+                ]
+
+            async def __aenter__(self) -> "FakeClient":
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                pass
+
+            async def post(self, *args: object, **kwargs: object) -> FakeResponse:
+                self.requests.append(kwargs["json"])
+                return self.responses.pop(0)
+
+        async def run() -> list[str]:
+            async def tool_runner(name: str, arguments: dict[str, object]) -> dict[str, object]:
+                return {"result": "hit"}
+
+            provider = OpenAIProvider(Settings(openai_api_key="key", chat_mcp_max_rounds=1))
+            chunks = await _collect(
+                provider.generate(
+                    [Message(role="user", content="find index")],
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "search_simple",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }
+                    ],
+                    tool_runner=tool_runner,
+                )
+            )
+            return [chunk.type for chunk in chunks]
+
+        fake = FakeClient()
+        old_client = openai_provider.httpx.AsyncClient
+        openai_provider.httpx.AsyncClient = lambda **_: fake
+        try:
+            with self.assertLogs("app.models.openai_provider", level="WARNING") as logs:
+                chunk_types = asyncio.run(run())
+        finally:
+            openai_provider.httpx.AsyncClient = old_client
+
+        self.assertEqual(chunk_types, ["tool_call", "tool_result", "token"])
+        self.assertNotIn("tools", fake.requests[1])
+        self.assertIn("Tool budget reached", fake.requests[1]["input"][-1]["content"])
+        self.assertIn("cloud_provider_tool_round_limit_finalize", "\n".join(logs.output))
 
     def test_cloud_provider_names_blank_http_error(self) -> None:
         class FakeClient:
@@ -508,6 +722,8 @@ class BackendTest(unittest.TestCase):
             arguments: dict[str, object],
             allowed_tools: set[str],
         ) -> dict[str, object]:
+            if name == "search_simple":
+                return []
             self.assertEqual(name, "vault_read")
             self.assertEqual(arguments, {"path": "00-Index.md"})
             return {"content": "Main vault index content"}
@@ -539,6 +755,71 @@ class BackendTest(unittest.TestCase):
 
         self.assertEqual([item["type"] for item in events], ["token", "sources", "done"])
         self.assertEqual(events[1]["sources"][0]["path"], "00-Index.md")
+
+    def test_chat_grounding_reads_vault_content_before_provider(self) -> None:
+        captured: dict[str, object] = {}
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        class FakeProvider:
+            name = "cloud"
+
+            async def generate(self, messages: list[Message], **kwargs: object):
+                captured["messages"] = messages
+                yield Chunk(type="token", content="answer")
+
+        async def fake_chat_tools(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            return []
+
+        async def fake_run_tool(
+            name: str,
+            arguments: dict[str, object],
+            allowed_tools: set[str],
+        ) -> dict[str, object]:
+            calls.append((name, arguments))
+            if name == "vault_read" and arguments == {"path": "00-Index.md"}:
+                return {"content": "[[02-Personal/linux-notepad-plus/README.md|notepad++]]"}
+            if name == "vault_read":
+                return {"content": "Linux Notepad Plus is a personal Linux editor project."}
+            self.fail(f"unexpected tool: {name}")
+
+        async def run() -> list[dict[str, object]]:
+            response = await chat_api.chat(ChatRequest(message="what is my notepad++ project?"))
+            items = []
+            async for item in response.body_iterator:
+                if isinstance(item, bytes):
+                    item = item.decode()
+                items.append(json.loads(item.removeprefix("data: ").strip()))
+            return items
+
+        old_provider = chat_api.get_provider
+        old_chat_tools = chat_api._chat_tools
+        old_run_tool = chat_api._run_chat_tool
+        old_settings = chat_api.settings
+        chat_api.get_provider = lambda *args, **kwargs: FakeProvider()
+        chat_api._chat_tools = fake_chat_tools
+        chat_api._run_chat_tool = fake_run_tool
+        chat_api.settings = Settings(chat_mcp_enabled=True)
+        try:
+            events = asyncio.run(run())
+        finally:
+            chat_api.get_provider = old_provider
+            chat_api._chat_tools = old_chat_tools
+            chat_api._run_chat_tool = old_run_tool
+            chat_api.settings = old_settings
+
+        messages = captured["messages"]
+        self.assertEqual(messages[0].role, "system")
+        self.assertIn("Vault Context", messages[0].content)
+        self.assertIn("Linux Notepad Plus is a personal Linux editor project", messages[0].content)
+        self.assertEqual(messages[1].content, "what is my notepad++ project?")
+        self.assertEqual(calls[0], ("vault_read", {"path": "00-Index.md"}))
+        self.assertEqual(calls[1], ("vault_read", {"path": "02-Personal/linux-notepad-plus/README.md"}))
+        self.assertEqual(calls[2], ("vault_read", {"path": "02-Personal/linux-notepad-plus/state.md"}))
+        self.assertEqual([item["type"] for item in events], ["token", "sources", "done"])
+        self.assertEqual(
+            [source["path"] for source in events[1]["sources"]],
+            ["00-Index.md", "02-Personal/linux-notepad-plus/README.md", "02-Personal/linux-notepad-plus/state.md"],
+        )
 
     def test_chat_logs_mcp_tool_summary(self) -> None:
         async def fake_call_tool(name: str, arguments: dict[str, object]) -> dict[str, object]:

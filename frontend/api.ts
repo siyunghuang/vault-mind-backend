@@ -8,7 +8,7 @@ const API_BASE =
 export type Provider = "cloud" | "local";
 export type ModelChoice = {
   id: string;
-  provider: "local" | "nvidia" | "gemini";
+  provider: "local" | "nvidia" | "gemini" | "openai";
   model: string;
   available: boolean;
   default: boolean;

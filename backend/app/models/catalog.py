@@ -21,6 +21,10 @@ def catalog(settings: Settings) -> list[dict[str, Any]]:
         rows.append(
             {"id": f"gemini:{model}", "provider": "gemini", "model": model, "available": bool(settings.gemini_api_key)}
         )
+    for model in _split(settings.openai_models, settings.openai_model):
+        rows.append(
+            {"id": f"openai:{model}", "provider": "openai", "model": model, "available": bool(settings.openai_api_key)}
+        )
     return rows
 
 
@@ -31,6 +35,8 @@ def default_model_id(settings: Settings) -> str:
         return f"local:{settings.local_model_name}"
     if settings.cloud_provider == "gemini":
         model = settings.gemini_model
+    elif settings.cloud_provider == "openai":
+        model = settings.openai_model
     else:
         model = settings.cloud_model
     return f"{settings.cloud_provider}:{model}"
@@ -44,6 +50,8 @@ def resolve_model(settings: Settings, provider: str | None = None, model_id: str
         elif provider == "cloud":
             if settings.cloud_provider == "gemini":
                 model = settings.gemini_model
+            elif settings.cloud_provider == "openai":
+                model = settings.openai_model
             else:
                 model = settings.cloud_model
             target = f"{settings.cloud_provider}:{model}"

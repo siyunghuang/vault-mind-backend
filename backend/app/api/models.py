@@ -18,7 +18,11 @@ async def models() -> dict[str, object]:
             {
                 "name": "cloud",
                 "provider": settings.cloud_provider,
-                "model": settings.gemini_model if settings.cloud_provider == "gemini" else settings.cloud_model,
+                "model": settings.gemini_model
+                if settings.cloud_provider == "gemini"
+                else settings.openai_model
+                if settings.cloud_provider == "openai"
+                else settings.cloud_model,
             },
         ],
     }
