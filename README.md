@@ -173,7 +173,7 @@ sequenceDiagram
     end
     API->>MCP: list_tools
     MCP-->>API: Tool schemas
-    Note over API: Keep read-only allowlist; construct system context
+    Note over API: Keep read-only allowlist and construct system context
     API->>Model: Grounded messages and function definitions
     loop While model requests tools, within round budget
         Model-->>API: Function calls
